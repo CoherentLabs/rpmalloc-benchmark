@@ -248,7 +248,7 @@ thread_yield(void);
 #define pointer_diff(first, second) (ptrdiff_t)((const char*)(first) - (const char*)(second))
 
 //! Size of a span header
-#define SPAN_HEADER_SIZE          40
+#define SPAN_HEADER_SIZE          48 // Not exactly right, but keeps memory 16-aligned
 
 #if ARCH_64BIT
 typedef int64_t offset_t;
@@ -1586,6 +1586,7 @@ span_t* _get_span_from_segment(segment_t* new_segment) {
 		}
 	}
 	span_t* span = pointer_offset(new_segment->first_span, slot * SPAN_MAX_SIZE);
+
 	span->owner_segment = new_segment;
 	// Calculate the address of the slot
 	return span;
@@ -1593,9 +1594,10 @@ span_t* _get_span_from_segment(segment_t* new_segment) {
 
 void _return_span_to_segment(segment_t* segment, span_t* span) {
 	span_t* first_span = segment->first_span;
-	uint32_t slot = (uint32_t)(pointer_diff(span, segment) / SPAN_MAX_SIZE);
+	uint32_t slot = (uint32_t)(pointer_diff(span, first_span) / SPAN_MAX_SIZE);
 
 	assert(slot < SPANS_PER_SEGMENT);
+	assert((slots & (1 << b)) == 1);
 
 	int32_t slots;
 	int32_t new_slots;
