@@ -187,6 +187,9 @@ atomic_store_ptr(atomicptr_t* dst, void* val) {
 static FORCEINLINE int
 atomic_cas_ptr(atomicptr_t* dst, void* val, void* ref);
 
+static FORCEINLINE int
+atomic_cas_value(atomic32_t* dst, uint32_t val, uint32_t ref);
+
 static void
 thread_yield(void);
 
@@ -207,6 +210,9 @@ thread_yield(void);
 #define SPAN_CLASS_GRANULARITY    4
 //! Number of size classes for spans
 #define SPAN_CLASS_COUNT          (SPAN_MAX_PAGE_COUNT / SPAN_CLASS_GRANULARITY)
+
+#define QUICK_ALLOCATION_PAGES_COUNT SPAN_MAX_PAGE_COUNT
+#define SPANS_PER_SEGMENT 32
 
 //! Granularity of a small allocation block
 #define SMALL_GRANULARITY         16
@@ -242,7 +248,7 @@ thread_yield(void);
 #define pointer_diff(first, second) (ptrdiff_t)((const char*)(first) - (const char*)(second))
 
 //! Size of a span header
-#define SPAN_HEADER_SIZE          32
+#define SPAN_HEADER_SIZE          40
 
 #if ARCH_64BIT
 typedef int64_t offset_t;
@@ -270,6 +276,8 @@ typedef struct span_block_t span_block_t;
 typedef union span_data_t span_data_t;
 //! Cache data
 typedef struct span_counter_t span_counter_t;
+//! Segment - holding spans
+typedef struct segment_t segment_t;
 
 struct span_block_t {
 	//! Free list
@@ -300,6 +308,8 @@ struct span_t {
 	span_t*     next_span;
 	//! Previous span
 	span_t*     prev_span;
+
+	segment_t* owner_segment;
 };
 _Static_assert(sizeof(span_t) <= SPAN_HEADER_SIZE, "span size mismatch");
 
@@ -360,11 +370,21 @@ struct size_class_t {
 };
 _Static_assert(sizeof(size_class_t) == 8, "Size class size mismatch");
 
+#define SINGLE_SEGMENT_MARKER 1
+struct segment_t {
+	atomicptr_t next_segment;
+	atomic32_t free_markers;
+	span_t* first_span;
+};
+
 //! Global size classes
 static size_class_t _memory_size_class[SIZE_CLASS_COUNT];
 
 //! Heap ID counter
 static atomic32_t _memory_heap_id;
+
+//! Free segments
+static atomicptr_t _segments_head;
 
 #ifdef PLATFORM_POSIX
 //! Virtual memory address counter
@@ -404,11 +424,17 @@ static atomic32_t _mapped_total;
 static atomic32_t _unmapped_total;
 #endif
 
-static void*
+static span_t*
 _memory_map(size_t page_count);
 
 static void
-_memory_unmap(void* ptr, size_t page_count);
+_memory_unmap(span_t* ptr, size_t page_count);
+
+static void*
+_memory_allocate_external(size_t bytes);
+
+static void
+_memory_deallocate_external(void* ptr);
 
 static int
 _memory_deallocate_deferred(heap_t* heap, size_t size_class);
@@ -886,7 +912,7 @@ _memory_allocate_heap(void) {
 	}
 
 	//Map in pages for a new heap
-	heap = _memory_map(2);
+	heap = _memory_allocate_external(2 * PAGE_SIZE);
 	memset(heap, 0, sizeof(heap_t));
 
 	//Get a new heap ID
@@ -1258,13 +1284,16 @@ static void
 _memory_adjust_size_class(size_t iclass) {
 	//Calculate how many pages are needed for 255 blocks
 	size_t block_size = _memory_size_class[iclass].size;
-	size_t page_count = (block_size * 255) / PAGE_SIZE;
+
+	//TODO: STNK Hardcode always 16 pages
+	//size_t page_count = (block_size * 255) / PAGE_SIZE;
+	size_t page_count = QUICK_ALLOCATION_PAGES_COUNT;
 	//Cap to 16 pages (64KiB span granularity)
-	page_count = (page_count == 0) ? 1 : ((page_count > 16) ? 16 : page_count);
+	page_count = (page_count == 0) ? 1 : ((page_count > QUICK_ALLOCATION_PAGES_COUNT) ? QUICK_ALLOCATION_PAGES_COUNT : page_count);
 	//Merge page counts to span size class granularity
 	page_count = ((page_count + (SPAN_CLASS_GRANULARITY - 1)) / SPAN_CLASS_GRANULARITY) * SPAN_CLASS_GRANULARITY;
-	if (page_count > 16)
-		page_count = 16;
+	if (page_count > QUICK_ALLOCATION_PAGES_COUNT)
+		page_count = QUICK_ALLOCATION_PAGES_COUNT;
 	size_t block_count = ((page_count * PAGE_SIZE) - SPAN_HEADER_SIZE) / block_size;
 	//Store the final configuration
 	_memory_size_class[iclass].page_count = (uint16_t)page_count;
@@ -1330,6 +1359,8 @@ rpmalloc_initialize(void) {
 		_memory_size_class[SMALL_CLASS_COUNT + iclass].size = (uint16_t)size;
 		_memory_adjust_size_class(SMALL_CLASS_COUNT + iclass);
 	}
+
+	atomic_store_ptr(&_segments_head, 0);
 	
 	//Initialize this thread
 	rpmalloc_thread_initialize();
@@ -1370,7 +1401,7 @@ rpmalloc_finalize(void) {
 			}
 
 			heap_t* next_heap = heap->next_heap;
-			_memory_unmap(heap, 2);
+			_memory_deallocate_external(heap);
 			heap = next_heap;
 		}
 
@@ -1522,60 +1553,193 @@ rpmalloc_is_thread_initialized(void) {
 	return (_memory_thread_heap != 0) ? 1 : 0;
 }
 
-//! Map new pages to virtual memory
-static void*
-_memory_map(size_t page_count) {
-	size_t total_size = page_count * PAGE_SIZE;
-	void* pages_ptr = 0;
-
-#if ENABLE_STATISTICS
-	atomic_add32(&_mapped_pages, (int32_t)page_count);
-	atomic_add32(&_mapped_total, (int32_t)page_count);
-#endif
-
-#ifdef PLATFORM_WINDOWS
-	pages_ptr = VirtualAlloc(0, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-	//mmap lacks a way to set 64KiB address granularity, implement it locally
-	intptr_t incr = (intptr_t)total_size / (intptr_t)SPAN_ADDRESS_GRANULARITY;
-	if (total_size % SPAN_ADDRESS_GRANULARITY)
-		++incr;
+void _publish_segment_on_global_list(segment_t* new_segment)
+{
+	atomic_thread_fence_acquire();
+	segment_t* head = 0;
 	do {
-		void* base_addr = (void*)(uintptr_t)atomic_exchange_and_add64(&_memory_addr,
-		                  (incr * (intptr_t)SPAN_ADDRESS_GRANULARITY));
-		pages_ptr = mmap(base_addr, total_size, PROT_READ | PROT_WRITE,
-		                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
-		if (pages_ptr != MAP_FAILED) {
-			if (pages_ptr != base_addr) {
-				void* new_base = (void*)((uintptr_t)pages_ptr & SPAN_MASK);
-				atomic_store64(&_memory_addr, (int64_t)((uintptr_t)new_base) +
-							   ((incr + 1) * (intptr_t)SPAN_ADDRESS_GRANULARITY));
-				atomic_thread_fence_release();
+		head = atomic_load_ptr(&_segments_head);
+		atomic_store_ptr(&new_segment->next_segment, head);
+	} while (!atomic_cas_ptr(&_segments_head, new_segment, head));
+}
+
+span_t* _get_span_from_segment(segment_t* new_segment) {
+	int slot = SPANS_PER_SEGMENT + 1;
+	while (slot == SPANS_PER_SEGMENT + 1) {
+		uint32_t slots = atomic_load32(&new_segment->free_markers);
+		if (slots == 0xFFFFFFFF) {
+			return 0; // It's full
+		}
+		// Find a free slot
+		for (int b = 0; b < SPANS_PER_SEGMENT; ++b) {
+			const uint32_t bit_mask = (1 << b);
+			if ((slots & bit_mask) == 0)
+			{
+				uint32_t new_slots = slots | bit_mask;
+				// Try to mark the slot as used
+				if (atomic_cas_value(&new_segment->free_markers, new_slots, slots))
+				{
+					slot = b;
+					break;
+				}
 			}
-			if (!((uintptr_t)pages_ptr & ~SPAN_MASK))
-				break;
-			munmap(pages_ptr, total_size);
 		}
 	}
-	while (1);
-#endif
+	span_t* span = pointer_offset(new_segment->first_span, slot * SPAN_MAX_SIZE);
+	span->owner_segment = new_segment;
+	// Calculate the address of the slot
+	return span;
+}
 
-	return pages_ptr;
+void _return_span_to_segment(segment_t* segment, span_t* span) {
+	span_t* first_span = segment->first_span;
+	uint32_t slot = (uint32_t)(pointer_diff(span, segment) / SPAN_MAX_SIZE);
+
+	assert(slot < SPANS_PER_SEGMENT);
+
+	int32_t slots;
+	int32_t new_slots;
+	do
+	{
+		slots = atomic_load32(&segment->free_markers);
+		new_slots = slots & ~(1 << slot);
+	} while (!atomic_cas_value(&segment->free_markers, new_slots, slots));
+}
+
+//! Map new pages to virtual memory
+static span_t*
+_memory_map(size_t page_count) {
+//	size_t total_size = page_count * PAGE_SIZE;
+//	void* pages_ptr = 0;
+//
+//#if ENABLE_STATISTICS
+//	atomic_add32(&_mapped_pages, (int32_t)page_count);
+//	atomic_add32(&_mapped_total, (int32_t)page_count);
+//#endif
+//
+//#ifdef PLATFORM_WINDOWS
+//	pages_ptr = VirtualAlloc(0, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+//#else
+//	//mmap lacks a way to set 64KiB address granularity, implement it locally
+//	intptr_t incr = (intptr_t)total_size / (intptr_t)SPAN_ADDRESS_GRANULARITY;
+//	if (total_size % SPAN_ADDRESS_GRANULARITY)
+//		++incr;
+//	do {
+//		void* base_addr = (void*)(uintptr_t)atomic_exchange_and_add64(&_memory_addr,
+//		                  (incr * (intptr_t)SPAN_ADDRESS_GRANULARITY));
+//		pages_ptr = mmap(base_addr, total_size, PROT_READ | PROT_WRITE,
+//		                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
+//		if (pages_ptr != MAP_FAILED) {
+//			if (pages_ptr != base_addr) {
+//				void* new_base = (void*)((uintptr_t)pages_ptr & SPAN_MASK);
+//				atomic_store64(&_memory_addr, (int64_t)((uintptr_t)new_base) +
+//							   ((incr + 1) * (intptr_t)SPAN_ADDRESS_GRANULARITY));
+//				atomic_thread_fence_release();
+//			}
+//			if (!((uintptr_t)pages_ptr & ~SPAN_MASK))
+//				break;
+//			munmap(pages_ptr, total_size);
+//		}
+//	}
+//	while (1);
+//#endif
+//
+//	return pages_ptr;
+
+	span_t* span = 0;
+	if (page_count <= QUICK_ALLOCATION_PAGES_COUNT)
+	{
+		// Look for a span of correct size within the cache
+		segment_t* global_segment = atomic_load_ptr(&_segments_head);
+		for (;;)
+		{
+			if (!global_segment)
+			{
+				// Create a new cachable segment and put it on the cache
+				size_t size = (SPAN_MAX_SIZE * SPANS_PER_SEGMENT) + sizeof(segment_t) + SPAN_ADDRESS_GRANULARITY;
+				segment_t* segment = _memory_allocate_external(size);
+				memset(segment, 0, sizeof(segment_t));
+				span = pointer_offset(segment, sizeof(segment_t));
+				// Align to the required size of the spans
+				if ((uintptr_t)span & (SPAN_ADDRESS_GRANULARITY - 1))
+					span = (void*)(((uintptr_t)span & ~((uintptr_t)SPAN_ADDRESS_GRANULARITY - 1)) + SPAN_ADDRESS_GRANULARITY);
+				span->owner_segment = segment;
+				
+				segment->first_span = span;
+				// Directly use this first span
+				atomic_store32(&segment->free_markers, 1);
+
+				_publish_segment_on_global_list(segment);
+			}
+			else
+			{
+				span = _get_span_from_segment(global_segment);
+				if (!span)
+				{
+					// Try the next one
+					global_segment = atomic_load_ptr(&global_segment->next_segment);
+				}
+			}
+
+			if (span)
+				break;
+		}
+	}
+	// Allocate a segment of the minimal required size
+	else
+	{
+		size_t size = page_count * PAGE_SIZE + sizeof(segment_t) + SPAN_ADDRESS_GRANULARITY;
+		segment_t* segment = _memory_allocate_external(size);
+		span = pointer_offset(segment, sizeof(segment_t));
+		// Align to the required size of the spans
+		if ((uintptr_t)span & (SPAN_ADDRESS_GRANULARITY - 1))
+			span = (void*)(((uintptr_t)span & ~((uintptr_t)SPAN_ADDRESS_GRANULARITY - 1)) + SPAN_ADDRESS_GRANULARITY);
+
+		segment->first_span = span;
+		atomic_store_ptr(&segment->next_segment, (void*)SINGLE_SEGMENT_MARKER);
+		// Allocate a segment that will not be re-used
+		span->owner_segment = segment;
+	}
+	assert(span && span->owner_segment);
+	return span;
 }
 
 //! Unmap pages from virtual memory
 static void
-_memory_unmap(void* ptr, size_t page_count) {
-#if ENABLE_STATISTICS
-	atomic_add32(&_mapped_pages, -(int32_t)page_count);
-	atomic_add32(&_unmapped_total, (int32_t)page_count);
-#endif
+_memory_unmap(span_t* span, size_t page_count) {
+//#if ENABLE_STATISTICS
+//	atomic_add32(&_mapped_pages, -(int32_t)page_count);
+//	atomic_add32(&_unmapped_total, (int32_t)page_count);
+//#endif
+//
+//#ifdef PLATFORM_WINDOWS
+//	VirtualFree(ptr, 0, MEM_RELEASE);
+//#else
+//	munmap(ptr, PAGE_SIZE * page_count);
+//#endif
+	segment_t* segment = span->owner_segment;
+	assert(segment);
+	segment_t* nn = atomic_load_ptr(&segment->next_segment);
+	if (nn == (void*)SINGLE_SEGMENT_MARKER)
+	{
+		_memory_deallocate_external(segment);
+	}
+	else
+	{
+		_return_span_to_segment(segment, span);
+	}
+}
 
-#ifdef PLATFORM_WINDOWS
+static void*
+_memory_allocate_external(size_t bytes)
+{
+	return VirtualAlloc(0, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+
+static void
+_memory_deallocate_external(void* ptr)
+{
 	VirtualFree(ptr, 0, MEM_RELEASE);
-#else
-	munmap(ptr, PAGE_SIZE * page_count);
-#endif
 }
 
 static FORCEINLINE int
@@ -1590,6 +1754,16 @@ atomic_cas_ptr(atomicptr_t* dst, void* val, void* ref) {
 #  endif
 #else
 	return __sync_bool_compare_and_swap(&dst->nonatomic, ref, val);
+#endif
+}
+
+static FORCEINLINE int
+atomic_cas_value(atomic32_t* dst, uint32_t val, uint32_t ref) {
+#ifdef _MSC_VER
+	return (_InterlockedCompareExchange((volatile long*)&dst->nonatomic,
+		(long)val, (long)ref) == (long)ref) ? 1 : 0;
+#else
+	ERROR IMPLEMENT ME!
 #endif
 }
 
