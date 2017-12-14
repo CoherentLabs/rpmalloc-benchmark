@@ -1683,6 +1683,10 @@ void _return_span_to_segment(segment_t* segment, span_t* span) {
 		// Now free if everything went ok - the segment has been unlinked
 		if (head)
 		{
+			#if ENABLE_STATISTICS
+				atomic_add32(&_mapped_pages, -(int32_t)QUICK_ALLOCATION_PAGES_COUNT);
+				atomic_add32(&_unmapped_total, (int32_t)QUICK_ALLOCATION_PAGES_COUNT);
+			#endif
 			_memory_deallocate_external(head);
 		}
 	}
@@ -1691,43 +1695,6 @@ void _return_span_to_segment(segment_t* segment, span_t* span) {
 //! Map new pages to virtual memory
 static span_t*
 _memory_map(size_t page_count) {
-//	size_t total_size = page_count * PAGE_SIZE;
-//	void* pages_ptr = 0;
-//
-//#if ENABLE_STATISTICS
-//	atomic_add32(&_mapped_pages, (int32_t)page_count);
-//	atomic_add32(&_mapped_total, (int32_t)page_count);
-//#endif
-//
-//#ifdef PLATFORM_WINDOWS
-//	pages_ptr = VirtualAlloc(0, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-//#else
-//	//mmap lacks a way to set 64KiB address granularity, implement it locally
-//	intptr_t incr = (intptr_t)total_size / (intptr_t)SPAN_ADDRESS_GRANULARITY;
-//	if (total_size % SPAN_ADDRESS_GRANULARITY)
-//		++incr;
-//	do {
-//		void* base_addr = (void*)(uintptr_t)atomic_exchange_and_add64(&_memory_addr,
-//		                  (incr * (intptr_t)SPAN_ADDRESS_GRANULARITY));
-//		pages_ptr = mmap(base_addr, total_size, PROT_READ | PROT_WRITE,
-//		                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
-//		if (pages_ptr != MAP_FAILED) {
-//			if (pages_ptr != base_addr) {
-//				void* new_base = (void*)((uintptr_t)pages_ptr & SPAN_MASK);
-//				atomic_store64(&_memory_addr, (int64_t)((uintptr_t)new_base) +
-//							   ((incr + 1) * (intptr_t)SPAN_ADDRESS_GRANULARITY));
-//				atomic_thread_fence_release();
-//			}
-//			if (!((uintptr_t)pages_ptr & ~SPAN_MASK))
-//				break;
-//			munmap(pages_ptr, total_size);
-//		}
-//	}
-//	while (1);
-//#endif
-//
-//	return pages_ptr;
-
 	span_t* span = 0;
 	if (page_count <= QUICK_ALLOCATION_PAGES_COUNT)
 	{
@@ -1799,22 +1766,17 @@ _memory_map(size_t page_count) {
 //! Unmap pages from virtual memory
 static void
 _memory_unmap(span_t* span, size_t page_count) {
-//#if ENABLE_STATISTICS
-//	atomic_add32(&_mapped_pages, -(int32_t)page_count);
-//	atomic_add32(&_unmapped_total, (int32_t)page_count);
-//#endif
-//
-//#ifdef PLATFORM_WINDOWS
-//	VirtualFree(ptr, 0, MEM_RELEASE);
-//#else
-//	munmap(ptr, PAGE_SIZE * page_count);
-//#endif
 	segment_t* segment = span->owner_segment;
 	assert(segment);
 	segment_t* nn = atomic_load_ptr(&segment->next_segment);
 	if (nn == (void*)SINGLE_SEGMENT_MARKER)
 	{
 		_memory_deallocate_external(segment);
+
+		#if ENABLE_STATISTICS
+			atomic_add32(&_mapped_pages, -(int32_t)page_count);
+			atomic_add32(&_unmapped_total, (int32_t)page_count);
+		#endif
 	}
 	else
 	{
@@ -1825,6 +1787,10 @@ _memory_unmap(span_t* span, size_t page_count) {
 static void*
 _memory_allocate_external(size_t bytes)
 {
+	#if ENABLE_STATISTICS
+		atomic_add32(&_mapped_pages, bytes / PAGE_SIZE);
+		atomic_add32(&_mapped_total, bytes / PAGE_SIZE);
+	#endif
 	return VirtualAlloc(0, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
