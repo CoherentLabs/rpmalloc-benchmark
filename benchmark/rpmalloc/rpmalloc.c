@@ -193,6 +193,9 @@ atomic_cas_value(atomic32_t* dst, uint32_t val, uint32_t ref);
 static void
 thread_yield(void);
 
+void _acquire_segments_lock_write();
+void _release_segments_lock_write();
+
 // Preconfigured limits and sizes
 
 //! Memory page size
@@ -1449,6 +1452,20 @@ rpmalloc_finalize(void) {
 		}
 		atomic_store_ptr(&_memory_large_cache[iclass], 0);
 	}
+
+	// Free all segments
+	_acquire_segments_lock_write();
+
+	segment_t* head = atomic_load_ptr(&_segments_head);
+	segment_t* next;
+	while (head)
+	{
+		next = atomic_load_ptr(&head->next_segment);
+		_memory_deallocate_external(head);
+		head = next;
+	}
+
+	_release_segments_lock_write();
 
 	atomic_thread_fence_release();
 }
