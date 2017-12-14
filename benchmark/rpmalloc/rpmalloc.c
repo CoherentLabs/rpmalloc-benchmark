@@ -386,6 +386,9 @@ static atomic32_t _memory_heap_id;
 //! Free segments
 static atomicptr_t _segments_head;
 
+//! Segment RW lock
+static atomic32_t _segments_rw_lock;
+
 #ifdef PLATFORM_POSIX
 //! Virtual memory address counter
 static atomic64_t _memory_addr;
@@ -1361,6 +1364,7 @@ rpmalloc_initialize(void) {
 	}
 
 	atomic_store_ptr(&_segments_head, 0);
+	atomic_store32(&_segments_rw_lock, 0);
 	
 	//Initialize this thread
 	rpmalloc_thread_initialize();
@@ -1553,14 +1557,55 @@ rpmalloc_is_thread_initialized(void) {
 	return (_memory_thread_heap != 0) ? 1 : 0;
 }
 
+FORCEINLINE int _get_readers_count(int32_t l)
+{
+	return l & 0x7FFFFFFF;
+}
+
+void _acquire_segments_lock_read()
+{
+	int32_t l = 0;
+	int32_t new_l = 0;
+	do {
+		atomic_thread_fence_acquire();
+		l = atomic_load32(&_segments_rw_lock);
+		// Try to increase the readers count
+		new_l = _get_readers_count(l) + 1;
+	} while (!atomic_cas_value(&_segments_rw_lock, new_l, l));
+}
+
+void _release_segments_lock_read()
+{
+	int32_t l = 0;
+	int32_t new_l = 0;
+	do {
+		atomic_thread_fence_acquire();
+		l = atomic_load32(&_segments_rw_lock);
+		// Try to decrease the readers count
+		new_l = _get_readers_count(l) - 1;
+	} while (!atomic_cas_value(&_segments_rw_lock, new_l, l));
+	atomic_thread_fence_release();
+}
+
+void _acquire_segments_lock_write()
+{
+	while (!atomic_cas_value(&_segments_rw_lock, 1, 0));
+}
+
+void _release_segments_lock_write()
+{
+	while (!atomic_cas_value(&_segments_rw_lock, 0, 1));
+}
+
 void _publish_segment_on_global_list(segment_t* new_segment)
 {
-	atomic_thread_fence_acquire();
-	segment_t* head = 0;
-	do {
-		head = atomic_load_ptr(&_segments_head);
-		atomic_store_ptr(&new_segment->next_segment, head);
-	} while (!atomic_cas_ptr(&_segments_head, new_segment, head));
+	_acquire_segments_lock_write();
+
+	segment_t* head = atomic_load_ptr(&_segments_head);
+	atomic_store_ptr(&new_segment->next_segment, head);
+	atomic_store_ptr(&_segments_head, new_segment);
+
+	_release_segments_lock_write();
 }
 
 span_t* _get_span_from_segment(segment_t* new_segment) {
@@ -1606,6 +1651,55 @@ void _return_span_to_segment(segment_t* segment, span_t* span) {
 		slots = atomic_load32(&segment->free_markers);
 		new_slots = slots & ~(1 << slot);
 	} while (!atomic_cas_value(&segment->free_markers, new_slots, slots));
+
+	// Check if it's completely empty and we should free it
+	if (new_slots == 0)
+	{
+		_acquire_segments_lock_write();
+
+		// Find the segment and delete it (if still empty)
+		segment_t* prev = 0;
+		segment_t* head = atomic_load_ptr(&_segments_head);
+		while (head && head != segment)
+		{
+			prev = head;
+			head = atomic_load_ptr(&head->next_segment);
+		}
+		
+		if (head)
+		{
+			slots = atomic_load32(&head->free_markers);
+			new_slots = slots & ~(1 << slot);
+
+			// Still empty?
+			if (new_slots == 0)
+			{
+				assert(head == segment);
+
+				// It's the head
+				if (!prev)
+				{
+					atomic_store_ptr(&_segments_head, atomic_load_ptr(&head->next_segment));
+				}
+				else
+				{
+					atomic_store_ptr(&prev->next_segment, atomic_load_ptr(&head->next_segment));
+				}
+			}
+			else
+			{
+				head = 0;
+			}
+		}
+
+		_release_segments_lock_write();
+
+		// Now free if everything went ok - the segment has been unlinked
+		if (head)
+		{
+			_memory_deallocate_external(head);
+		}
+	}
 }
 
 //! Map new pages to virtual memory
@@ -1651,6 +1745,8 @@ _memory_map(size_t page_count) {
 	span_t* span = 0;
 	if (page_count <= QUICK_ALLOCATION_PAGES_COUNT)
 	{
+		int should_release = 1;
+		_acquire_segments_lock_read();
 		// Look for a span of correct size within the cache
 		segment_t* global_segment = atomic_load_ptr(&_segments_head);
 		for (;;)
@@ -1671,6 +1767,9 @@ _memory_map(size_t page_count) {
 				// Directly use this first span
 				atomic_store32(&segment->free_markers, 1);
 
+				_release_segments_lock_read();
+				should_release = 0;
+
 				_publish_segment_on_global_list(segment);
 			}
 			else
@@ -1685,6 +1784,11 @@ _memory_map(size_t page_count) {
 
 			if (span)
 				break;
+		}
+
+		if (should_release)
+		{
+			_release_segments_lock_read();
 		}
 	}
 	// Allocate a segment of the minimal required size
