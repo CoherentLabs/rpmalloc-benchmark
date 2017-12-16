@@ -64,6 +64,11 @@
 #define ENABLE_ASSERTS            0
 #endif
 
+#ifndef DEFINE_EXTERNAL_ALLOCATION_FUNCS
+//! Define the external allocation/deallocation functions
+#define DEFINE_EXTERNAL_ALLOCATION_FUNCS 1
+#endif
+
 // Platform and arch specifics
 
 #ifdef _MSC_VER
@@ -243,6 +248,8 @@ void _release_segments_lock_write();
 
 #define SPAN_LIST_LOCK_TOKEN      ((void*)1)
 
+#define SINGLE_SEGMENT_MARKER 1
+
 #define pointer_offset(ptr, ofs) (void*)((char*)(ptr) + (ptrdiff_t)(ofs))
 #define pointer_diff(first, second) (ptrdiff_t)((const char*)(first) - (const char*)(second))
 
@@ -307,7 +314,8 @@ struct span_t {
 	span_t*     next_span;
 	//! Previous span
 	span_t*     prev_span;
-
+	//! The segment that owns this span
+	//  or SINGLE_SEGMENT_MARKER if the span is not part of a segment
 	segment_t* owner_segment;
 };
 _Static_assert(sizeof(span_t) <= SPAN_HEADER_SIZE, "span size mismatch");
@@ -340,10 +348,6 @@ struct heap_t {
 	span_t*      large_cache[LARGE_CLASS_COUNT];
 	//! Allocation counters for large blocks
 	span_counter_t large_counter[LARGE_CLASS_COUNT];
-	//! Next heap in id list
-	heap_t*      next_heap;
-	//! Next heap in orphan list
-	heap_t*      next_orphan;
 #if ENABLE_STATISTICS
 	//! Number of bytes currently reqeusted in allocations
 	size_t       requested;
@@ -369,7 +373,6 @@ struct size_class_t {
 };
 _Static_assert(sizeof(size_class_t) == 8, "Size class size mismatch");
 
-#define SINGLE_SEGMENT_MARKER 1
 struct segment_t {
 	atomicptr_t next_segment;
 	atomic32_t free_markers;
@@ -381,6 +384,9 @@ static size_class_t _memory_size_class[SIZE_CLASS_COUNT];
 
 //! Heap ID counter
 static atomic32_t _memory_heap_id;
+
+//! Heaps array lock
+static atomic32_t _heaps_lock;
 
 //! Free segments
 static atomicptr_t _segments_head;
@@ -402,14 +408,11 @@ static atomicptr_t _memory_large_cache[LARGE_CLASS_COUNT];
 //! Current thread heap
 static _Thread_local heap_t* _memory_thread_heap TLS_MODEL;
 
+//! Preferred heap of this thread
+static _Thread_local uint32_t _memory_preferred_heap TLS_MODEL;
+
 //! All heaps
 static atomicptr_t _memory_heaps[HEAP_ARRAY_SIZE];
-
-//! Orphaned heaps
-static atomicptr_t _memory_orphan_heaps;
-
-//! Active heap count
-static atomic32_t _memory_active_heaps;
 
 //! Adaptive cache max allocation count
 static uint32_t _memory_max_allocation;
@@ -432,23 +435,23 @@ _memory_map(size_t page_count);
 static void
 _memory_unmap(span_t* ptr, size_t page_count);
 
-static void*
+void*
 _memory_allocate_external(size_t bytes);
 
-static void
+void
 _memory_deallocate_external(void* ptr);
 
 static int
 _memory_deallocate_deferred(heap_t* heap, size_t size_class);
 
+heap_t* _get_heap_ptr(void* heap) {
+	return (heap_t*)((size_t)heap & ~1);
+}
+
 //! Lookup a memory heap from heap ID
 static heap_t*
 _memory_heap_lookup(int32_t id) {
-	uint32_t list_idx = id % HEAP_ARRAY_SIZE;
-	heap_t* heap = atomic_load_ptr(&_memory_heaps[list_idx]);
-	while (heap && (heap->id != id))
-		heap = heap->next_heap;
-	return heap;
+	return _get_heap_ptr(atomic_load_ptr(&_memory_heaps[id]));
 }
 
 //! Increase an allocation counter
@@ -886,22 +889,9 @@ use_cache:
 static heap_t*
 _memory_allocate_heap(void) {
 	heap_t* heap;
-	heap_t* next_heap;
 	//Try getting an orphaned heap
 	atomic_thread_fence_acquire();
-	do {
-		heap = atomic_load_ptr(&_memory_orphan_heaps);
-		if (!heap)
-			break;
-		next_heap = heap->next_orphan;
-	}
-	while (!atomic_cas_ptr(&_memory_orphan_heaps, next_heap, heap));
-
-	if (heap) {
-		heap->next_orphan = 0;
-		return heap;
-	}
-
+	
 	//Map in pages for a new heap
 	heap = _memory_allocate_external(2 * PAGE_SIZE);
 	memset(heap, 0, sizeof(heap_t));
@@ -913,15 +903,6 @@ _memory_allocate_heap(void) {
 			heap->id = 0;
 	}
 	while (!heap->id);
-
-	//Link in heap in heap ID map
-	size_t list_idx = heap->id % HEAP_ARRAY_SIZE;
-	do {
-		next_heap = atomic_load_ptr(&_memory_heaps[list_idx]);
-		heap->next_heap = next_heap;
-	}
-	while (!atomic_cas_ptr(&_memory_heaps[list_idx], heap, next_heap));
-
 	return heap;
 }
 
@@ -1343,7 +1324,8 @@ rpmalloc_initialize(void) {
 
 	atomic_store_ptr(&_segments_head, 0);
 	atomic_store32(&_segments_rw_lock, 0);
-	
+	atomic_store32(&_heaps_lock, 0);
+
 	//Initialize this thread
 	rpmalloc_thread_initialize();
 	return 0;
@@ -1356,8 +1338,8 @@ rpmalloc_finalize(void) {
 
 	//Free all thread caches
 	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
-		heap_t* heap = atomic_load_ptr(&_memory_heaps[list_idx]);
-		while (heap) {
+		heap_t* heap = _get_heap_ptr(atomic_load_ptr(&_memory_heaps[list_idx]));
+		if (heap) {
 			_memory_deallocate_deferred(heap, 0);
 
 			const size_t page_count = QUICK_ALLOCATION_PAGES_COUNT;
@@ -1379,15 +1361,11 @@ rpmalloc_finalize(void) {
 					span = next_span;
 				}
 			}
-
-			heap_t* next_heap = heap->next_heap;
 			_memory_deallocate_external(heap);
-			heap = next_heap;
 		}
 
 		atomic_store_ptr(&_memory_heaps[list_idx], 0);
 	}
-	atomic_store_ptr(&_memory_orphan_heaps, 0);
 
 	//Free global caches
 	void* span_ptr = atomic_load_ptr(&_memory_span_cache);
@@ -1441,100 +1419,79 @@ rpmalloc_finalize(void) {
 	atomic_thread_fence_release();
 }
 
+int _is_heap_in_use(void* heap) {
+	return ((size_t)heap & 1);
+}
+
+void* _mark_heap_in_use(void* heap) {
+	return (void*)((size_t)heap | 1);
+}
+
+void _acquire_heaps_lock()
+{
+	while (!atomic_cas_value(&_heaps_lock, 1, 0));
+	atomic_thread_fence_acquire();
+}
+
+void _release_heaps_lock()
+{
+	atomic_thread_fence_release();
+	while (!atomic_cas_value(&_heaps_lock, 0, 1));
+}
+
 //! Initialize thread, assign heap
 void
 rpmalloc_thread_initialize(void) {
 	if (!_memory_thread_heap) {
-		heap_t* heap =  _memory_allocate_heap();
+		_acquire_heaps_lock();
+		
+		void* heap_ptr = atomic_load_ptr(&_memory_heaps[_memory_preferred_heap]);
+				
+		for (uint32_t id = _memory_preferred_heap; id < HEAP_ARRAY_SIZE + _memory_preferred_heap; ++id)
+		{
+			heap_ptr = atomic_load_ptr(&_memory_heaps[id % HEAP_ARRAY_SIZE]);
+			if (heap_ptr && !_is_heap_in_use(heap_ptr))
+			{
+				_memory_thread_heap = _get_heap_ptr(heap_ptr);
+				atomic_store_ptr(&_memory_heaps[id % HEAP_ARRAY_SIZE], _mark_heap_in_use(heap_ptr));
+				_memory_preferred_heap = (id % HEAP_ARRAY_SIZE);
+				break;
+			}
+		}
+		
+		if (!_memory_thread_heap)
+		{
+			// We have to allocate a new heap
+			heap_t* heap = _memory_allocate_heap();
+			
+			int32_t id = heap->id;
+			assert(atomic_load32(&_memory_heaps[id]) == 0);
+			_memory_thread_heap = heap;
+			atomic_store_ptr(&_memory_heaps[id], _mark_heap_in_use(heap));
+			_memory_preferred_heap = id;
+		}
+
+		_release_heaps_lock();
+
 #if ENABLE_STATISTICS
 		heap->thread_to_global = 0;
 		heap->global_to_thread = 0;
 #endif
-		_memory_thread_heap = heap;
-		atomic_incr32(&_memory_active_heaps);
 	}
+	assert(_memory_thread_heap);
 }
 
-//! Finalize thread, orphan heap
 void
-rpmalloc_thread_finalize(void) {
-	heap_t* heap = _memory_thread_heap;
-	if (!heap)
+rpmalloc_thread_reset(void) {
+	if (!_memory_thread_heap)
 		return;
 
-	atomic_add32(&_memory_active_heaps, -1);
+	_acquire_heaps_lock();
+	void* heap_ptr = atomic_load_ptr(&_memory_heaps[_memory_preferred_heap]);
+	assert(_is_heap_in_use(heap_ptr));
+	atomic_store_ptr(&_memory_heaps[_memory_preferred_heap], _mark_heap_in_use(heap_ptr));
+	_release_heaps_lock();
 
-	_memory_deallocate_deferred(heap, 0);
-
-	//Release thread cache spans back to global cache
-	const size_t page_count = QUICK_ALLOCATION_PAGES_COUNT;
-	span_t* span = heap->span_cache;
-	while (span) {
-		if (span->data.list_size > MIN_SPAN_CACHE_RELEASE) {
-			count_t list_size = 1;
-			span_t* next = span->next_span;
-			span_t* last = span;
-			while (list_size < MIN_SPAN_CACHE_RELEASE) {
-				last = next;
-				next = next->next_span;
-				++list_size;
-			}
-			last->next_span = 0; //Terminate list
-			next->data.list_size = span->data.list_size - list_size;
-			_memory_global_cache_insert(span, list_size, page_count);
-			span = next;
-		}
-		else {
-			_memory_global_cache_insert(span, span->data.list_size, page_count);
-			span = 0;
-		}
-	}
-	heap->span_cache = 0;
-
-	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
-		const size_t span_count = iclass + 1;
-		span_t* span = heap->large_cache[iclass];
-		while (span) {
-			if (span->data.list_size > MIN_SPAN_CACHE_RELEASE) {
-				count_t list_size = 1;
-				span_t* next = span->next_span;
-				span_t* last = span;
-				while (list_size < MIN_SPAN_CACHE_RELEASE) {
-					last = next;
-					next = next->next_span;
-					++list_size;
-				}
-				last->next_span = 0; //Terminate list
-				next->data.list_size = span->data.list_size - list_size;
-				_memory_global_cache_large_insert(span, list_size, span_count);
-				span = next;
-			}
-			else {
-				_memory_global_cache_large_insert(span, span->data.list_size, span_count);
-				span = 0;
-			}
-		}
-		heap->large_cache[iclass] = 0;
-	}
-
-	//Reset allocation counters
-	memset(&heap->span_counter, 0, sizeof(heap->span_counter));
-	memset(heap->large_counter, 0, sizeof(heap->large_counter));
-#if ENABLE_STATISTICS
-	heap->requested = 0;
-	heap->allocated = 0;
-	heap->thread_to_global = 0;
-	heap->global_to_thread = 0;
-#endif
-
-	//Orphan the heap
-	heap_t* last_heap;
-	do {
-		last_heap = atomic_load_ptr(&_memory_orphan_heaps);
-		heap->next_orphan = last_heap;
-	}
-	while (!atomic_cas_ptr(&_memory_orphan_heaps, heap, last_heap));
-	
 	_memory_thread_heap = 0;
 }
 

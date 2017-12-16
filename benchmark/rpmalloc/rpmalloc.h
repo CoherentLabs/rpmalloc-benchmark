@@ -73,7 +73,7 @@ extern void
 rpmalloc_thread_initialize(void);
 
 extern void
-rpmalloc_thread_finalize(void);
+rpmalloc_thread_reset(void);
 
 extern void
 rpmalloc_thread_collect(void);
