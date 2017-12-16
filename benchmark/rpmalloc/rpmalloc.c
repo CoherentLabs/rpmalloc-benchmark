@@ -1,13 +1,15 @@
-/* rpmalloc.c  -  Memory allocator  -  Public Domain  -  2016 Mattias Jansson / Rampant Pixels
- *
- * This library provides a cross-platform lock free thread caching malloc implementation in C11.
- * The latest source code is always available at
- *
- * https://github.com/rampantpixels/rpmalloc
- *
- * This library is put in the public domain; you can redistribute it and/or modify it without any restrictions.
- *
- */
+/* rpmalloc.h  -  Memory allocator  -  Public Domain  -  2016 Mattias Jansson / Rampant Pixels
+* Copyright 2017 Stoyan Nikolov, Coherent Labs
+*
+* This library provides a cross-platform lock free thread caching malloc implementation in C11.
+* The latest source code is always available at
+*
+* https://github.com/rampantpixels/rpmalloc
+* https://github.com/CoherentLabs/rpmalloc
+*
+* This library is put in the public domain; you can redistribute it and/or modify it without any restrictions.
+*
+*/
 
 #include "rpmalloc.h"
 
