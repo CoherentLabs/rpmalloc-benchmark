@@ -2,6 +2,8 @@
 #include <rpmalloc/rpmalloc.h>
 #include <benchmark.h>
 
+#include <Windows.h>
+
 int
 benchmark_initialize() {
 	return rpmalloc_initialize();
@@ -21,7 +23,7 @@ benchmark_thread_initialize(void) {
 
 int
 benchmark_thread_finalize(void) {
-	rpmalloc_thread_finalize();
+	rpmalloc_thread_reset();
 	return 0;
 }
 
@@ -38,6 +40,16 @@ benchmark_malloc(size_t alignment, size_t size) {
 extern void
 benchmark_free(void* ptr) {
 	rpfree(ptr);
+}
+
+void* rpmalloc_allocate_memory_external(size_t bytes)
+{
+	return VirtualAlloc(0, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+
+void rpmalloc_deallocate_memory_external(void* ptr)
+{
+	VirtualFree(ptr, 0, MEM_RELEASE);
 }
 
 const char*
